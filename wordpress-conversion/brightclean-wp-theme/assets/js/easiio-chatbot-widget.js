@@ -891,11 +891,53 @@
     if (!state.messages) return;
     const message = document.createElement('div');
     message.className = `easiio-chatbot-message easiio-chatbot-message-${role}`;
-    message.textContent = text;
+    if (role === 'bot') {
+      message.innerHTML = renderSafeMarkdown(text);
+    } else {
+      message.textContent = text;
+    }
     state.messages.appendChild(message);
     if (!options || !options.skipCache) saveCachedMessage(role, text);
     scrollMessages();
     return message;
+  }
+
+  function renderSafeMarkdown(value) {
+    // Escape first so model output can never inject HTML, then apply a small,
+    // intentionally limited Markdown subset suitable for chat answers.
+    const normalized = String(value || '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\s+-\s+(?=\*\*[^*]+\*\*\s*:)/g, '\n- ')
+      .replace(/\s+(?=Please note\b)/gi, '\n\n');
+    const inline = line => escapeHtml(line)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+      .replace(/\[(Source\s+\d+)\]/gi, '<span class="easiio-chatbot-citation">[$1]</span>');
+    const lines = normalized.split('\n');
+    const blocks = [];
+    let listItems = [];
+    const flushList = () => {
+      if (!listItems.length) return;
+      blocks.push(`<ul>${listItems.map(item => `<li>${inline(item)}</li>`).join('')}</ul>`);
+      listItems = [];
+    };
+    lines.forEach(line => {
+      const trimmed = line.trim();
+      const bullet = trimmed.match(/^[-*]\s+(.+)$/);
+      if (bullet) {
+        listItems.push(bullet[1]);
+        return;
+      }
+      flushList();
+      if (!trimmed) {
+        blocks.push('');
+      } else {
+        blocks.push(`<p>${inline(trimmed)}</p>`);
+      }
+    });
+    flushList();
+    return blocks.join('').replace(/<p><\/p>/g, '');
   }
 
   function renderVoicePlayback(messageNode, text, response) {

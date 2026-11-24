@@ -20,6 +20,18 @@ class DemoContentTests(unittest.TestCase):
         self.assertIn("sample completed jobs", content.lower())
         self.assertIn("fictional classroom", content.lower())
 
+    def test_chatbot_renders_safe_markdown_for_bot_answers(self):
+        widget_paths = (
+            ROOT / "assets/js/easiio-chatbot-widget.js",
+            ROOT / "wordpress-conversion/brightclean-wp-theme/assets/js/easiio-chatbot-widget.js",
+        )
+        for widget_path in widget_paths:
+            source = widget_path.read_text(encoding="utf-8")
+            self.assertIn("function renderSafeMarkdown", source, str(widget_path))
+            self.assertIn("message.innerHTML = renderSafeMarkdown(text)", source, str(widget_path))
+            self.assertIn("message.textContent = text", source, str(widget_path))
+            self.assertIn("escapeHtml", source, str(widget_path))
+
 
 if __name__ == "__main__":
     unittest.main()
