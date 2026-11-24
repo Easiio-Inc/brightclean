@@ -47,6 +47,7 @@ FIELDS = {
 }
 
 MODELS=('gpt-4o-mini','gpt-4o','gpt-4.1-mini','gpt-4.1')
+NON_CHAT_MODEL_MARKERS=('embedding','audio','whisper','image','dall-e','tts','realtime','transcribe','transcription','moderation')
 LEAD_FIELDS={'name':('Name','text','name'),'email':('Email','email','email'),'phone':('Phone','text','tel'),'company':('Company','text','organization'),'message':('Message','textarea','')}
 
 def default_settings():
@@ -75,6 +76,35 @@ def read_api_key(root):
     try:
         line=(Path(root)/'data/secrets/openai.env').read_text().strip(); return line.split('=',1)[1] if line.startswith('EASIIO_CHATBOT_LLM_API_KEY=') else ''
     except OSError: return ''
+
+def read_runtime_environment(root):
+    result={}
+    try: lines=(Path(root)/'data/runtime.env').read_text(encoding='utf-8').splitlines()
+    except OSError: lines=[]
+    for line in lines:
+        line=line.strip()
+        if not line or line.startswith('#') or '=' not in line: continue
+        name,value=line.split('=',1); name=name.strip(); value=value.strip().strip('"').strip("'")
+        if name=='EASIIO_RAG_DATABASE_URL': result[name]=value
+    return result
+
+def chat_model_options(payload):
+    rows=payload.get('data',[]) if isinstance(payload,dict) else []
+    models=[]
+    for row in rows:
+        model=row.get('id','') if isinstance(row,dict) else ''
+        if model and not any(marker in model.lower() for marker in NON_CHAT_MODEL_MARKERS) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:-]{0,99}',model): models.append(model)
+    return sorted(set(models))
+
+def discover_models(base_url,key,timeout=8):
+    request=Request(base_url.rstrip('/')+'/models',headers={'Authorization':'Bearer '+key,'Accept':'application/json'})
+    with urlopen(request,timeout=timeout) as response:
+        require(200<=response.status<300,502,'OpenAI connection failed')
+        try: payload=json.loads(response.read())
+        except (ValueError,UnicodeError): raise Problem(502,'Model service returned invalid JSON')
+    models=chat_model_options(payload)
+    require(bool(models),502,'No chat-capable text models were returned')
+    return models
 
 def valid_url(value,allow_http=True):
     if value=='': return True
@@ -236,6 +266,8 @@ class Application:
         self.sessions = {}
         self.failures = []
         self.lock = threading.RLock()
+        current=read_json(self.root/'data/llm-settings.json',default_llm_settings())
+        self.model_options=sorted(set(MODELS+(current.get('model','gpt-4o-mini'),)))
     def settings(self,method,payload):
         target=self.root/'data/site-settings.json'
         if method=='GET': return 200,read_json(target,default_settings())
@@ -245,15 +277,19 @@ class Application:
         target=self.root/'data/llm-settings.json'; current=read_json(target,default_llm_settings()); key=read_api_key(self.root)
         if test:
             require(method=='POST',405,'Method not allowed'); require(bool(key),400,'Configure an API key first')
-            request=Request(current['base_url'].rstrip('/')+'/models',headers={'Authorization':'Bearer '+key,'Accept':'application/json'})
-            try:
-                with urlopen(request,timeout=8) as response: require(200<=response.status<300,502,'OpenAI connection failed')
+            try: self.model_options=discover_models(current['base_url'],key)
             except Problem: raise
             except Exception: raise Problem(502,'Connection failed. Check the key, base URL, and network.')
-            return 200,{'ok':True,'message':'Connection successful'}
+            host=urlsplit(current['base_url']).hostname or ''
+            return 200,{'ok':True,'message':f'Connection successful; found {len(self.model_options)} chat-capable models.','model_options':self.model_options,'diagnostics':{'endpoint_host':host,'model_count':len(self.model_options),'selected_model_available':current.get('model') in self.model_options,'models_refreshed':True}}
         if method=='GET':
+            models_status='cached'
+            if key:
+                try: self.model_options=discover_models(current.get('base_url','https://api.openai.com/v1'),key); models_status='live'
+                except Exception: pass
             suffix=('••••'+key[-4:]) if key else ''
-            return 200,{'provider':'OpenAI','model':current.get('model','gpt-4o-mini'),'base_url':current.get('base_url','https://api.openai.com/v1'),'configured':bool(key),'masked_key':suffix,'restart_required':bool(current.get('restart_required',False)),'model_options':list(MODELS)}
+            runtime=read_runtime_environment(self.root); database_url=os.environ.get('EASIIO_RAG_DATABASE_URL') or runtime.get('EASIIO_RAG_DATABASE_URL','')
+            return 200,{'provider':'OpenAI','model':current.get('model','gpt-4o-mini'),'base_url':current.get('base_url','https://api.openai.com/v1'),'configured':bool(key),'masked_key':suffix,'restart_required':bool(current.get('restart_required',False)),'model_options':self.model_options,'models_status':models_status,'runtime':{'llm':{'configured':bool(key),'model':current.get('model','gpt-4o-mini'),'endpoint_host':urlsplit(current.get('base_url','')).hostname or ''},'pgvector':{'configured':bool(database_url),'embedding_model':'text-embedding-3-small','embedding_dimension':1536}}}
         require(method in ('PUT','POST'),405,'Method not allowed'); value=validate_llm(payload)
         if payload.get('clear_key'):
             try: (self.root/'data/secrets/openai.env').unlink()

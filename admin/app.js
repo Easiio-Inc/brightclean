@@ -140,8 +140,10 @@ function renderSettings(){
   const list=el('datalist');list.id='models';llmSettings.model_options.forEach(x=>{const o=el('option');o.value=x;list.append(o);});root.append(list,settingInput('base_url',llmSettings.base_url));
   const key=settingInput('api_key','');key.querySelector('input').type='password';key.querySelector('input').placeholder='Leave blank to keep current';root.append(key);
   root.append(el('p',llmSettings.configured?'API key configured '+llmSettings.masked_key:'No API key configured','notice'));
+  const runtime=llmSettings.runtime||{}, llmRuntime=runtime.llm||{}, vectorRuntime=runtime.pgvector||{};
+  root.append(el('p',`Runtime: LLM ${llmRuntime.configured?'configured':'not configured'} · model list ${llmSettings.models_status||'cached'} · pgvector ${vectorRuntime.configured?'configured':'not configured'}${vectorRuntime.configured?` · ${vectorRuntime.embedding_model}/${vectorRuntime.embedding_dimension}`:''}`,'muted'));
   const actions=el('div',undefined,'form-actions'),test=el('button','Test connection','secondary'),clear=el('button','Clear API key','delete');test.type=clear.type='button';
-  test.onclick=async()=>{try{const r=await api('llm/test','POST',{});message(r.message);}catch(e){message(e.message,true);}};
+  test.onclick=async()=>{try{const r=await api('llm/test','POST',{});llmSettings.model_options=r.model_options||llmSettings.model_options;llmSettings.models_status='live';renderSettings();message(r.message);}catch(e){message(e.message,true);}};
   clear.onclick=async()=>{if(confirm('Clear the saved API key?')){llmSettings=await api('llm','PUT',{model:root.querySelector('[name=model]').value,base_url:root.querySelector('[name=base_url]').value,clear_key:true});renderSettings();message('API key cleared. Restart chatbot to apply.');}};
   actions.append(test,clear);root.append(actions,el('p',llmSettings.restart_required?'Restart chatbot to apply saved AI changes.':'AI settings are active.','muted'));
  } else if(settingsPanel==='lead_form'){

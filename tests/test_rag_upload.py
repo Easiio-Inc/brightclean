@@ -33,6 +33,14 @@ class RagStoreTests(unittest.TestCase):
     def test_irrelevant_vector_only_candidate_is_filtered(self):
         db=FakeAdapter(); db.semantic=[{'chunk_id':'noise','text':'Unrelated gardening advice','semantic_score':.12}]
         self.assertEqual(rag_store.HybridRagStore(db,FakeEmbedding()).search('tenant','office cleaning prices'),[])
+    def test_realistic_openai_cosine_scores_keep_matches_but_reject_low_noise(self):
+        db=FakeAdapter(); db.semantic=[
+            {'chunk_id':'price','text':'Standard cleaning starts at $149.','semantic_score':.538},
+            {'chunk_id':'supplies','text':'Our team brings cleaning supplies.','semantic_score':.403},
+            {'chunk_id':'noise','text':'Unrelated gardening advice.','semantic_score':.19},
+        ]
+        result=rag_store.HybridRagStore(db,FakeEmbedding()).search('tenant','what does a visit cost and what should I provide?',5)
+        self.assertEqual([row['chunk_id'] for row in result],['price','supplies'])
     def test_semantic_paraphrase_survives_conservative_threshold(self):
         db=FakeAdapter(); db.semantic=[{'chunk_id':'match','text':'We clean empty homes after tenants leave','semantic_score':.91}]
         result=rag_store.HybridRagStore(db,FakeEmbedding()).search('tenant','move-out service',3)

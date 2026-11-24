@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="${BRIGHTCLEAN_PYTHON:-python3}"
+if [ -n "${BRIGHTCLEAN_PYTHON:-}" ]; then
+  PYTHON="$BRIGHTCLEAN_PYTHON"
+elif [ -x "$ROOT/.venv/bin/python" ]; then
+  PYTHON="$ROOT/.venv/bin/python"
+else
+  PYTHON="python3"
+fi
 mkdir -p "$ROOT/.run" "$ROOT/data"
 
 # Never reuse an old unrestricted chatbot or repository-wide static server.

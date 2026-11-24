@@ -16,12 +16,20 @@ ROOT=Path(__file__).resolve().parent
 SITE='class3-brightclean-san-jose'
 
 def load_llm_environment(root=ROOT):
-    from admin_server import read_json, default_llm_settings, read_api_key
+    from admin_server import read_json, default_llm_settings, read_api_key, read_runtime_environment
     value=read_json(Path(root)/'data/llm-settings.json',default_llm_settings()); key=read_api_key(root)
     if key: os.environ['EASIIO_CHATBOT_LLM_API_KEY']=key
     else: os.environ.pop('EASIIO_CHATBOT_LLM_API_KEY',None)
     os.environ['EASIIO_CHATBOT_LLM_MODEL']=value.get('model','gpt-4o-mini')
     os.environ['EASIIO_CHATBOT_LLM_BASE_URL']=value.get('base_url','https://api.openai.com/v1')
+    if key: os.environ['EASIIO_RAG_EMBEDDING_API_KEY']=key
+    else: os.environ.pop('EASIIO_RAG_EMBEDDING_API_KEY',None)
+    os.environ['EASIIO_RAG_EMBEDDING_BASE_URL']=value.get('base_url','https://api.openai.com/v1')
+    os.environ['EASIIO_RAG_EMBEDDING_MODEL']='text-embedding-3-small'
+    os.environ['EASIIO_RAG_EMBEDDING_DIMENSION']='1536'
+    runtime=read_runtime_environment(root)
+    if not os.environ.get('EASIIO_RAG_DATABASE_URL') and runtime.get('EASIIO_RAG_DATABASE_URL'):
+        os.environ['EASIIO_RAG_DATABASE_URL']=runtime['EASIIO_RAG_DATABASE_URL']
 
 def widget_config(root=ROOT):
     from admin_server import read_json, default_settings, LEAD_FIELDS

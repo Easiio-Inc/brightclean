@@ -2022,6 +2022,11 @@ def rerank_rag_candidates(question: str, candidates: list[dict[str, Any]], *, ke
         chunk = item["chunk"]
         text = str(chunk.get("text") or "")
         score = float(item.get("score") or 0)
+        # Preserve a modest advantage for a candidate that already passed the
+        # vector store's relevance gate. Lexical overlap is intentionally still
+        # able to win; this only prevents paraphrases from being erased here.
+        if "pgvector_hybrid" in (item.get("reasons") or []):
+            score += 0.08
         if query_lesson and find_lesson_number(text) == query_lesson:
             score += 0.8
         if re.search(r"\b(how to|steps|setup|configure)\b", question, re.I) and re.search(r"\b(step|configure|setup|install|use)\b", text, re.I):
@@ -2117,10 +2122,14 @@ def source_list(chunks: list[dict[str, Any]], limit: int = 3) -> list[dict[str, 
 
 def verify_grounded_answer(answer: str, selected_chunks: list[dict[str, Any]], question: str) -> dict[str, Any]:
     evidence = "\n".join(str(chunk.get("text") or "") for chunk in selected_chunks)
+    # Citation labels are formatting metadata, not factual numeric claims or
+    # answer vocabulary. Without removing them, every valid ``[Source 1]``
+    # answer failed whenever the source text did not itself contain the digit 1.
+    answer_for_verification = re.sub(r"\[\s*Source\s+\d+\s*\]", " ", answer, flags=re.I)
     evidence_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", evidence))
-    answer_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", answer))
+    answer_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", answer_for_verification))
     unsupported_numbers = answer_numbers - evidence_numbers
-    answer_tokens = tokenize(answer)
+    answer_tokens = tokenize(answer_for_verification)
     evidence_tokens = tokenize(evidence)
     overlap = len(answer_tokens & evidence_tokens) / max(1, len(answer_tokens)) if answer_tokens else 0.0
     supported = not unsupported_numbers and (overlap >= 0.18 or not answer_tokens)
@@ -2345,9 +2354,10 @@ def answer_from_site_rag(site_id: str, message: str, language: str = "") -> dict
     all_context = "\n".join(normalize_whitespace(" ".join(str(chunk.get(key, "")) for key in ("title", "section", "text"))) for chunk in all_chunks)
     direct_answer = direct_count_answer(message, all_context[:MAX_RAG_LLM_CONTEXT_CHARS], language)
     if direct_answer:
+        llm_answer = call_llm_answer_formatter(message, all_context[:MAX_RAG_LLM_CONTEXT_CHARS], language)
         return {
-            "reply": direct_answer,
-            "answer_source": "website_rag",
+            "reply": llm_answer or direct_answer,
+            "answer_source": "website_rag_llm" if llm_answer else "website_rag",
             "sources": source_list(all_chunks[:2]),
             "confidence": "high",
         }
@@ -2384,16 +2394,16 @@ def answer_from_site_rag(site_id: str, message: str, language: str = "") -> dict
     plain_context = "\n".join(normalize_whitespace(chunk.get("text", "")) for chunk in selected)[:MAX_RAG_LLM_CONTEXT_CHARS].rstrip()
     top_context = normalize_whitespace(selected[0].get("text", "")) if selected else plain_context
     direct_answer = direct_count_answer(message, plain_context, language)
+    formatted_context = format_rag_context(selected, max_chars=MAX_RAG_LLM_CONTEXT_CHARS)
+    llm_answer = call_llm_answer_formatter(message, formatted_context or plain_context, language)
     if direct_answer:
         return {
-            "reply": direct_answer,
-            "answer_source": "website_rag",
+            "reply": llm_answer or direct_answer,
+            "answer_source": "website_rag_llm" if llm_answer else "website_rag",
             "sources": source_list(selected),
             "confidence": "high",
         }
 
-    formatted_context = format_rag_context(selected, max_chars=MAX_RAG_LLM_CONTEXT_CHARS)
-    llm_answer = call_llm_answer_formatter(message, formatted_context or plain_context, language)
     answer_source = "website_rag_llm" if llm_answer else "website_rag"
     fallback_context = plain_context if is_marketing_capability_question(message) else (top_context or plain_context)
     answer = llm_answer or concise_extractive_answer(message, fallback_context, language)

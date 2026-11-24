@@ -186,6 +186,7 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(self.req('PUT','/api/settings',bad)[0],400)
 
     def test_phase_a_llm_secret_lifecycle(self):
+        (self.root/'data/secrets/openai.env').unlink(missing_ok=True)
         self.login(); data=self.req('GET','/api/llm')[1]
         self.assertFalse(data['configured']); self.assertNotIn('api_key',data)
         self.assertEqual(self.req('PUT','/api/llm',{'model':'../bad','base_url':'https://api.openai.com/v1','api_key':'sk-example-modern_1234567890'})[0],400)
@@ -201,12 +202,35 @@ class AdminTests(unittest.TestCase):
     def test_phase_a_llm_test_connection_mocked(self):
         self.login(); self.req('PUT','/api/llm',{'model':'gpt-4o-mini','base_url':'https://api.openai.com/v1','api_key':'sk-test_abcdefghijklmnop'})
         response=unittest.mock.MagicMock(); response.status=200; response.__enter__.return_value=response
+        response.read.return_value=json.dumps({'data':[{'id':'gpt-4o-mini'},{'id':'text-embedding-3-small'},{'id':'whisper-1'},{'id':'gpt-4.1'}]}).encode()
         with patch('admin_server.urlopen',return_value=response) as call:
             status,data,_=self.req('POST','/api/llm/test',{})
-            self.assertEqual((status,data),(200,{'ok':True,'message':'Connection successful'})); self.assertEqual(call.call_args.kwargs['timeout'],8)
+            self.assertEqual(status,200); self.assertTrue(data['ok'])
+            self.assertEqual(data['model_options'],['gpt-4.1','gpt-4o-mini'])
+            self.assertEqual(data['diagnostics']['model_count'],2)
+            self.assertNotIn('sk-',json.dumps(data)); self.assertEqual(call.call_args.kwargs['timeout'],8)
         with patch('admin_server.urlopen',side_effect=OSError('failed with sk-secret-value')):
             status,data,_=self.req('POST','/api/llm/test',{})
             self.assertEqual(status,502); self.assertNotIn('sk-secret',str(data))
+
+    def test_llm_get_discovers_chat_models_and_falls_back_to_cache(self):
+        self.login(); self.req('PUT','/api/llm',{'model':'custom-chat','base_url':'https://models.example/v1','api_key':'sk-test_abcdefghijklmnop'})
+        response=unittest.mock.MagicMock(); response.status=200; response.__enter__.return_value=response
+        response.read.return_value=json.dumps({'data':[{'id':'gpt-4o-mini'},{'id':'text-embedding-3-small'},{'id':'gpt-realtime'},{'id':'omni-moderation-latest'},{'id':'dall-e-3'},{'id':'custom-chat'}]}).encode()
+        with patch('admin_server.urlopen',return_value=response):
+            status,data,_=self.req('GET','/api/llm')
+        self.assertEqual(status,200)
+        self.assertEqual(data['model_options'],['custom-chat','gpt-4o-mini'])
+        self.assertTrue(data['runtime']['llm']['configured'])
+        # pgvector may legitimately be configured by the live runtime.env; the
+        # admin response must report only the boolean and never expose its URL.
+        self.assertIsInstance(data['runtime']['pgvector']['configured'],bool)
+        self.assertNotIn('database_url',json.dumps(data).lower())
+        with patch('admin_server.urlopen',side_effect=OSError('offline')):
+            status,fallback,_=self.req('GET','/api/llm')
+        self.assertEqual(status,200)
+        self.assertEqual(fallback['model_options'],data['model_options'])
+        self.assertEqual(fallback['models_status'],'cached')
 
     def test_phase_a_public_config_and_runtime_environment(self):
         import public_server as p
@@ -221,5 +245,20 @@ class AdminTests(unittest.TestCase):
             p.load_llm_environment(self.root)
             self.assertEqual(os.environ['EASIIO_CHATBOT_LLM_MODEL'],'gpt-4.1')
             self.assertEqual(os.environ['EASIIO_CHATBOT_LLM_API_KEY'],'sk-runtime_abcdefghijklmnop')
+            self.assertEqual(os.environ['EASIIO_RAG_EMBEDDING_API_KEY'],'sk-runtime_abcdefghijklmnop')
+            self.assertEqual(os.environ['EASIIO_RAG_EMBEDDING_BASE_URL'],'https://example.test/v1')
+            self.assertEqual(os.environ['EASIIO_RAG_EMBEDDING_MODEL'],'text-embedding-3-small')
+            self.assertEqual(os.environ['EASIIO_RAG_EMBEDDING_DIMENSION'],'1536')
+
+    def test_runtime_file_supplies_pgvector_without_ui_secret_exposure(self):
+        import public_server as p
+        (self.root/'data/runtime.env').write_text('EASIIO_RAG_DATABASE_URL=postgresql://user:secret@db/rag\n')
+        with patch.dict(os.environ,{},clear=True):
+            p.load_llm_environment(self.root)
+            self.assertEqual(os.environ['EASIIO_RAG_DATABASE_URL'],'postgresql://user:secret@db/rag')
+        self.login()
+        data=self.req('GET','/api/llm')[1]
+        self.assertTrue(data['runtime']['pgvector']['configured'])
+        self.assertNotIn('secret',json.dumps(data))
 
 if __name__=='__main__': unittest.main()

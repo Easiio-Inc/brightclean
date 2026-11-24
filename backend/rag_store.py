@@ -67,7 +67,10 @@ class PsycopgAdapter:
 class HybridRagStore:
     def __init__(self,adapter,embedding,fallback:Callable|None=None,dimension=None,min_relevance=None):
         self.adapter,self.embedding,self.fallback=adapter,embedding,fallback; self.dimension=int(dimension or embedding.dimension); self.last_warning=''
-        self.min_relevance=float(min_relevance if min_relevance is not None else os.getenv('EASIIO_RAG_MIN_RELEVANCE','0.65'))
+        # OpenAI embedding cosine similarities for good matches in a small,
+        # domain-specific corpus commonly sit around 0.40-0.55. 0.65 silently
+        # discarded those candidates before hybrid ranking could use them.
+        self.min_relevance=float(min_relevance if min_relevance is not None else os.getenv('EASIIO_RAG_MIN_RELEVANCE','0.40'))
         if not 0 <= self.min_relevance <= 1: raise ValueError('min_relevance must be between 0 and 1')
     def _validate(self,vectors):
         if any(len(v)!=self.dimension or any(type(x) not in (int,float) or not math.isfinite(x) for x in v) for v in vectors): raise EmbeddingError('embedding response contains invalid values or dimensions')
