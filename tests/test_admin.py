@@ -14,6 +14,21 @@ import admin_server as a
 
 ROOT = Path(__file__).resolve().parents[1]
 
+
+class FreshInstallTests(unittest.TestCase):
+    def test_application_bootstraps_empty_crm_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'data').mkdir()
+            a.Application(root, 'teacher', a.hash_password('test-password'))
+            with sqlite3.connect(root / 'data/class3-demo-crm.db') as db:
+                site = db.execute(
+                    'SELECT site_id FROM websites WHERE site_id=?',
+                    (a.SITE,),
+                ).fetchone()
+            self.assertEqual(site, (a.SITE,))
+
+
 class AdminTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

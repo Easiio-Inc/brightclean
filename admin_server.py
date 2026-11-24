@@ -20,6 +20,8 @@ import time
 from urllib.parse import urlsplit, parse_qs
 from urllib.request import Request, urlopen
 
+from backend.crm_core import SoloCRM
+
 ROOT = Path(__file__).resolve().parent
 SITE = 'class3-brightclean-san-jose'
 ITERATIONS = 600_000
@@ -134,6 +136,16 @@ def require(condition, status=400, message='Invalid input'):
 class Application:
     def __init__(self, root, username, password_hash, classroom=False):
         self.root, self.username, self.password_hash = Path(root), username, password_hash
+        crm = SoloCRM(self.root/'data/class3-demo-crm.db')
+        organization = crm.create_organization(
+            'BrightClean Classroom Demo',
+            slug='brightclean-classroom-demo',
+        )
+        crm.create_website(
+            SITE,
+            name='BrightClean San Jose',
+            organization_id=organization['id'],
+        )
         self.classroom = classroom
         self.sessions = {}
         self.failures = []
