@@ -1,0 +1,7 @@
+{
+  "site_id": "class3-brightclean-san-jose",
+  "appearance": {"enabled": true, "title": "BrightClean Assistant", "greeting": "Hi! Ask me about BrightClean's demo services, prices, service area, or policies.", "primary_color": "#123d3a", "position": "bottom-right", "launcher_style": "bubble", "launcher_size": "small", "avatar_url": ""},
+  "behavior": {"auto_open": false, "auto_open_delay_seconds": 0, "track_page_views": true, "exclude_paths": []},
+  "business": {"organization_name": "BrightClean San Jose", "website_name": "BrightClean San Jose", "phone": "(408) 555-0147", "email": "", "service_area": "San Jose, California", "hours": "Daily 8:00 AM–8:00 PM", "website_url": "http://127.0.0.1:8188/", "privacy_url": "", "consent_text": "By chatting, you agree that we may use your message to follow up about BrightClean services."},
+  "lead_form": {"enabled": true, "title": "Where should we follow up?", "description": "Optional — close this and keep chatting if you are not ready.", "submit_label": "Send inquiry", "fields": [{"name":"name","required":false},{"name":"email","required":true},{"name":"phone","required":false},{"name":"message","required":true}]}
+}

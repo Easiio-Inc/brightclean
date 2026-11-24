@@ -1,0 +1,27 @@
+.run/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.pid
+*.tmp
+*.bak
+.cache/
+.pytest_cache/
+.coverage
+
+.env
+.env.*
+*.pem
+*.key
+secrets/
+data/secrets/
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite-*
+
+# Seeded knowledge and non-secret settings JSON are intentionally trackable.
+!data/rag-content.json
+!data/site-settings.json
+!data/llm-settings.json
