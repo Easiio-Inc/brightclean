@@ -2354,6 +2354,22 @@ def answer_from_site_rag(site_id: str, message: str, language: str = "") -> dict
 
     query_plan = build_rag_query_plan(message, language)
     candidates = retrieve_rag_candidates(site_id, query_plan, limit=RAG_MAX_CANDIDATES)
+    # PostgreSQL is optional. Any driver, database, or embedding failure leaves
+    # the established JSON lexical path untouched. Keep the repository import
+    # outside this fallback so packaging/runtime resolution errors stay visible.
+    from backend.rag_store import configured_store
+    try:
+        vector_store=configured_store()
+        if vector_store:
+            semantic_rows=vector_store.search(site_id,message,RAG_MAX_SELECTED)
+            known={item.get('chunk',{}).get('chunk_id') for item in candidates}
+            for row in semantic_rows:
+                if row.get('chunk_id') in known: continue
+                metadata=row.get('metadata') if isinstance(row.get('metadata'),dict) else {}
+                chunk={'chunk_id':row.get('chunk_id',''),'text':row.get('text',''),'search_text':row.get('text',''),'title':row.get('title',''),'url':row.get('url') or metadata.get('source_url',''),'source':'pgvector','content_id':metadata.get('document_id',''),'site_id':site_id,'section':metadata.get('section',''),'tokens':tokenize(row.get('text','')),'summary_tokens':set()}
+                candidates.append({'chunk':chunk,'score':float(row.get('relevance_score') or 0.0),'reasons':['pgvector_hybrid']})
+    except Exception:
+        pass
     if not candidates:
         return None
     ranked = rerank_rag_candidates(message, candidates, keep=RAG_MAX_SELECTED)

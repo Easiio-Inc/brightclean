@@ -65,7 +65,7 @@ class AdminTests(unittest.TestCase):
         self.csrf = data['csrf']
         return cookie
     def test_unauthenticated(self):
-        for path in ['/api/rag','/api/contacts','/api/deals','/api/activities','/api/summary','/api/session']:
+        for path in ['/api/rag','/api/uploads','/api/uploads/missing/file','/api/contacts','/api/deals','/api/activities','/api/summary','/api/session']:
             for method in ['GET','POST','PUT','DELETE']:
                 self.assertEqual(self.req(method,path,{})[0],401)
         self.assertNotIn('test-password', self.req('GET','/')[1])

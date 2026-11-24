@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
+import sys
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +39,39 @@ class SelfContainedBackendTests(unittest.TestCase):
         self.assertIn("ROOT", path_expression)
         self.assertIn("backend", path_expression)
         self.assertIn("chatbot_app.py", path_expression)
+
+    def test_public_runtime_invokes_repository_pgvector_hook(self):
+        # Exercise the module exactly as the public process loads it by file
+        # spec. Patching the package-qualified module also guards against a
+        # second, top-level ``rag_store`` module being imported accidentally.
+        sys.path.insert(0, str(ROOT))
+        try:
+            import public_server
+            import backend.rag_store as repository_rag_store
+
+            vector_store = mock.Mock()
+            vector_store.search.return_value = []
+            fake_server = mock.Mock()
+            with (
+                mock.patch.object(repository_rag_store, "configured_store", return_value=vector_store) as configured,
+                mock.patch.object(
+                    public_server,
+                    "ThreadingHTTPServer",
+                    side_effect=lambda _address, handler: setattr(fake_server, "RequestHandlerClass", handler) or fake_server,
+                ),
+            ):
+                server = public_server.chatbot_server()
+                loaded_backend = server.RequestHandlerClass.__mro__[1].__module__
+                chatbot = sys.modules[loaded_backend]
+                chatbot.answer_from_site_rag("integration-pgvector-site", "hybrid retrieval probe")
+
+            configured.assert_called_once_with()
+            vector_store.search.assert_called_once_with(
+                "integration-pgvector-site", "hybrid retrieval probe", chatbot.RAG_MAX_SELECTED
+            )
+        finally:
+            if sys.path[0] == str(ROOT):
+                sys.path.pop(0)
 
 
 if __name__ == "__main__":

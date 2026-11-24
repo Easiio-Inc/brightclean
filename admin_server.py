@@ -17,6 +17,12 @@ import secrets
 import sqlite3
 import threading
 import time
+import io
+import mimetypes
+import zipfile
+import xml.etree.ElementTree as ET
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from urllib.parse import urlsplit, parse_qs
 from urllib.request import Request, urlopen
 
@@ -24,6 +30,14 @@ from backend.crm_core import SoloCRM
 
 ROOT = Path(__file__).resolve().parent
 SITE = 'class3-brightclean-san-jose'
+MAX_UPLOAD_BYTES = int(os.environ.get('EASIIO_RAG_UPLOAD_MAX_BYTES', str(10*1024*1024)))
+MAX_ZIP_MEMBERS = int(os.environ.get('EASIIO_RAG_ZIP_MAX_MEMBERS','2000'))
+MAX_ZIP_UNCOMPRESSED = int(os.environ.get('EASIIO_RAG_ZIP_MAX_UNCOMPRESSED',str(50*1024*1024)))
+MAX_ZIP_MEMBER_BYTES = int(os.environ.get('EASIIO_RAG_ZIP_MAX_MEMBER_BYTES',str(10*1024*1024)))
+MAX_ZIP_RATIO = int(os.environ.get('EASIIO_RAG_ZIP_MAX_RATIO','100'))
+MAX_EXTRACTED_CHARS = int(os.environ.get('EASIIO_RAG_MAX_EXTRACTED_CHARS',str(2*1024*1024)))
+MAX_PDF_PAGES = int(os.environ.get('EASIIO_RAG_MAX_PDF_PAGES','250'))
+UPLOAD_EXTENSIONS={'.txt','.docx','.pptx','.pdf'}
 ITERATIONS = 600_000
 TTL = 3600
 FIELDS = {
@@ -133,6 +147,78 @@ class Problem(Exception):
 def require(condition, status=400, message='Invalid input'):
     if not condition: raise Problem(status, message)
 
+def _safe_zip(data):
+    try: archive=zipfile.ZipFile(io.BytesIO(data))
+    except (zipfile.BadZipFile,OSError): raise Problem(400,'Corrupt Office document')
+    infos=archive.infolist()
+    require(len(infos)<=MAX_ZIP_MEMBERS,400,'Office document has too many members')
+    require(sum(i.file_size for i in infos)<=MAX_ZIP_UNCOMPRESSED,400,'Office document expands beyond the safe limit')
+    require(all(not i.filename.startswith(('/', '\\')) and '..' not in Path(i.filename).parts for i in infos),400,'Unsafe Office document')
+    require(all(not (i.flag_bits & 1) for i in infos),400,'Encrypted Office members are not supported')
+    require(all(i.file_size<=MAX_ZIP_MEMBER_BYTES and i.file_size<=MAX_ZIP_RATIO*max(i.compress_size,1) for i in infos),400,'Office member exceeds safe size or compression ratio')
+    names=[i.filename for i in infos]; require(len(names)==len(set(names)),400,'Duplicate Office members are not allowed')
+    return archive
+
+def parse_knowledge_file(filename,data):
+    ext=Path(filename).suffix.lower(); require(ext in UPLOAD_EXTENSIONS,415,'Allowed types: PDF, DOCX, PPTX, TXT')
+    if ext=='.txt':
+        require(b'\x00' not in data,400,'TXT appears to be binary')
+        try: text=data.decode('utf-8-sig')
+        except UnicodeDecodeError: raise Problem(400,'TXT must be UTF-8 encoded')
+        require(bool(text.strip()),400,'Document contains no text'); return text,{'pages':1}
+    if ext in ('.docx','.pptx'):
+        archive=_safe_zip(data); require('[Content_Types].xml' in archive.namelist(),400,'Invalid Office container')
+        try: content_types=ET.fromstring(archive.read('[Content_Types].xml'))
+        except ET.ParseError: raise Problem(400,'Corrupt Office content types')
+        expected=('/word/document.xml','application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml') if ext=='.docx' else ('/ppt/presentation.xml','application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml')
+        overrides={(node.attrib.get('PartName'),node.attrib.get('ContentType')) for node in content_types if node.tag.endswith('}Override') or node.tag=='Override'}
+        require(expected in overrides,400,f'Invalid {ext[1:].upper()} main-part content type')
+        if ext=='.docx':
+            require('word/document.xml' in archive.namelist(),400,'DOCX document body is missing')
+            try: root=ET.fromstring(archive.read('word/document.xml'))
+            except ET.ParseError: raise Problem(400,'Corrupt DOCX XML')
+            paragraphs=[]
+            for paragraph in root.iter():
+                if paragraph.tag.endswith('}p'):
+                    value=''.join(n.text or '' for n in paragraph.iter() if n.tag.endswith('}t')).strip()
+                    if value: paragraphs.append(value)
+            require(paragraphs,400,'DOCX contains no extractable text'); return '\n\n'.join(paragraphs),{'pages':1}
+        names=sorted((n for n in archive.namelist() if re.fullmatch(r'ppt/slides/slide\d+\.xml',n)),key=lambda n:int(re.search(r'\d+',Path(n).name).group()))
+        require(names,400,'PPTX contains no slides'); slides=[]
+        for number,name in enumerate(names,1):
+            try: root=ET.fromstring(archive.read(name))
+            except ET.ParseError: raise Problem(400,'Corrupt PPTX XML')
+            values=[n.text.strip() for n in root.iter() if n.tag.endswith('}t') and n.text and n.text.strip()]
+            if values: slides.append(f"Slide {number}\n"+'\n'.join(values))
+        require(slides,400,'PPTX contains no extractable text'); return '\n\n'.join(slides),{'pages':len(names)}
+    require(data.startswith(b'%PDF-'),400,'Invalid PDF signature')
+    try: import fitz
+    except (ImportError,ModuleNotFoundError): raise Problem(503,'PDF extraction requires PyMuPDF; install requirements-rag.txt')
+    try:
+        with fitz.open(stream=data,filetype='pdf') as doc:
+            require(not doc.needs_pass,400,'Encrypted PDFs are not supported')
+            require(len(doc)<=MAX_PDF_PAGES,413,'PDF exceeds the configured page limit')
+            pages=[]; extracted=0
+            for i,page in enumerate(doc):
+                page_text=page.get_text().strip(); extracted+=len(page_text)
+                require(extracted<=MAX_EXTRACTED_CHARS,413,'Extracted text exceeds the configured limit')
+                if page_text: pages.append(f"Page {i+1}\n{page_text}")
+    except Problem: raise
+    except Exception: raise Problem(400,'Corrupt PDF')
+    require(pages,422,'PDF has no extractable text; scanned PDFs require OCR and are not supported')
+    return '\n\n'.join(pages),{'pages':len(pages)}
+
+def chunk_document(document_id,text,size=1400,overlap=180):
+    require(size>0 and 0<=overlap<size,message='Invalid chunk settings')
+    chunks=[]; step=size-overlap
+    for start in range(0,len(text),step):
+        value=text[start:start+size]
+        if not value: break
+        digest=hashlib.sha256(value.encode()).hexdigest()
+        chunks.append({'chunk_id':f'{document_id}:{len(chunks)}:{digest[:12]}','text':value,'content_hash':digest})
+        if start+size>=len(text): break
+    return chunks
+
 class Application:
     def __init__(self, root, username, password_hash, classroom=False):
         self.root, self.username, self.password_hash = Path(root), username, password_hash
@@ -241,6 +327,8 @@ class Application:
         rows=doc.setdefault('sites',{}).setdefault(SITE,[])
         existing=next((r for r in rows if r['content_id']==ident),None)
         if ident: require(existing is not None,404,'Knowledge item not found')
+        if existing and existing.get('upload_id') and method in ('PUT','DELETE'):
+            raise Problem(409,f"Uploaded knowledge must be deleted with /api/uploads/{existing['upload_id']}")
         if method=='GET': return 200,existing if ident else rows
         if method=='DELETE':
             require(ident)
@@ -263,6 +351,66 @@ class Application:
         temporary.write_text(json.dumps(doc,indent=2)+'\n')
         os.replace(temporary,target)
         return (201 if method=='POST' else 200),result
+    def _upload_manifest(self): return self.root/'data/knowledge-files'/SITE/'manifest.json'
+    def _read_uploads(self): return read_json(self._upload_manifest(),{'uploads':[]}).get('uploads',[])
+    def upload_knowledge(self,site_id,filename,data):
+        require(site_id==SITE,403,'Site is outside this demo'); require(isinstance(data,bytes) and len(data)<=MAX_UPLOAD_BYTES,413,'Upload exceeds configured limit')
+        original=str(filename); require(original==Path(original).name and '/' not in original and '\\' not in original,400,'Filename must not contain a path')
+        text,details=parse_knowledge_file(original,data); require(len(text)<=MAX_EXTRACTED_CHARS,413,'Extracted text exceeds the configured limit')
+        upload_id='upl_'+secrets.token_hex(12); ext=Path(original).suffix.lower(); stored=upload_id+ext
+        source_link=f'/api/uploads/{upload_id}/file'; chunks=chunk_document('upload:'+upload_id,text); now=int(time.time())
+        content_hash=hashlib.sha256(text.encode()).hexdigest()
+        item={'content_id':'upload:'+upload_id,'document_id':'upload:'+upload_id,'title':Path(original).stem[:300] or 'Uploaded document','url':source_link,'content':text,'source':'upload','upload_id':upload_id,'original_filename':original,'mime_type':mimetypes.guess_type(original)[0] or 'application/octet-stream','file_sha256':hashlib.sha256(data).hexdigest(),'content_sha256':content_hash,'content_hash':content_hash,'chunk_count':len(chunks),'created_at':now,'updated_at':now}
+        target=self.root/'data/rag-content.json'; doc=read_json(target,{'version':1,'sites':{}}); doc.setdefault('sites',{}).setdefault(SITE,[]).append(item)
+        directory=self.root/'data/knowledge-files'/SITE; path=directory/stored; manifest=self._upload_manifest(); records=self._read_uploads(); record={**item,'stored_filename':stored,'size':len(data),**details}; records.append(record)
+        directory.mkdir(parents=True,exist_ok=True); old_target=target.read_bytes() if target.exists() else None; old_manifest=manifest.read_bytes() if manifest.exists() else None
+        try:
+            temporary=path.with_name(path.name+'.tmp'); temporary.write_bytes(data); os.replace(temporary,path)
+            atomic_json(target,doc); atomic_json(manifest,{'version':1,'uploads':records})
+        except Exception:
+            for temp in directory.glob('*.tmp'): temp.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+            if old_target is None: target.unlink(missing_ok=True)
+            else: target.write_bytes(old_target)
+            if old_manifest is None: manifest.unlink(missing_ok=True)
+            else: manifest.write_bytes(old_manifest)
+            raise
+        indexed=False; warning='Vector indexing is not configured; JSON search remains available.'
+        try:
+            from backend.rag_store import configured_store
+            store=configured_store()
+            if store:
+                store.ingest(SITE,{'document_id':item['content_id'],'upload_id':upload_id,'title':item['title'],'content':text,'content_hash':content_hash,'chunks':chunks,'source_url':source_link,'original_filename':original,'stored_filename':stored,'mime_type':item['mime_type'],'metadata':{'upload_id':upload_id}}); indexed=True; warning=''
+        except Exception:
+            warning='Vector indexing failed; JSON search remains available.'
+        public={k:v for k,v in record.items() if k!='stored_filename'}
+        return {**public,'source_link':source_link,'document_count':1,'indexed':indexed,'index_warning':warning}
+    def download_upload(self,site_id,upload_id):
+        require(site_id==SITE,403,'Site is outside this demo')
+        row=next((x for x in self._read_uploads() if x.get('upload_id')==upload_id),None); require(row is not None,404,'Upload not found')
+        base=(self.root/'data/knowledge-files'/SITE).resolve(); path=base/row['stored_filename']
+        require(not path.is_symlink() and path.is_file() and path.resolve().parent==base,404,'Upload not found')
+        return path.read_bytes(),row['original_filename'],row['mime_type']
+    def delete_upload(self,site_id,upload_id):
+        require(site_id==SITE,403,'Site is outside this demo'); records=self._read_uploads(); row=next((x for x in records if x.get('upload_id')==upload_id),None); require(row is not None,404,'Upload not found')
+        target=self.root/'data/rag-content.json'; manifest=self._upload_manifest(); path=self.root/'data/knowledge-files'/SITE/row['stored_filename']
+        doc=read_json(target,{'sites':{}}); rows=doc.setdefault('sites',{}).get(SITE,[]); doc['sites'][SITE]=[x for x in rows if x.get('upload_id')!=upload_id]
+        try:
+            from backend.rag_store import configured_store
+            store=configured_store()
+            if store: store.delete(SITE,row['content_id'])
+        except Exception:
+            raise Problem(503,'Vector index deletion failed; no files or records were deleted.')
+        old_target=target.read_bytes(); old_manifest=manifest.read_bytes(); old_file=path.read_bytes() if path.exists() else None
+        try:
+            atomic_json(target,doc); atomic_json(manifest,{'version':1,'uploads':[x for x in records if x.get('upload_id')!=upload_id]}); path.unlink(missing_ok=True)
+        except Exception:
+            target.write_bytes(old_target); manifest.write_bytes(old_manifest)
+            if old_file is not None: path.write_bytes(old_file)
+            for temp in path.parent.glob('*.tmp'): temp.unlink(missing_ok=True)
+            raise
+        indexed=bool(store); warning='' if store else 'Vector index is not configured.'
+        return {'ok':True,'upload_id':upload_id,'indexed':indexed,'index_warning':warning}
 
 class Handler(BaseHTTPRequestHandler):
     server_version='BrightClean'
@@ -283,15 +431,38 @@ class Handler(BaseHTTPRequestHandler):
             if method=='GET' and path in ('/','/app.js','/style.css'):
                 file={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}[path]
                 self.send(200,(app.root/'admin'/file).read_bytes(),ctype={'/':'text/html; charset=utf-8','/app.js':'text/javascript; charset=utf-8','/style.css':'text/css; charset=utf-8'}[path]); return
-            payload={}
+            payload={}; upload=None
             if method!='GET':
-                require(self.headers.get('Content-Type','').split(';')[0]=='application/json',415,'JSON required')
+                content_type=self.headers.get('Content-Type','')
                 try: length=int(self.headers.get('Content-Length','0'))
                 except ValueError: raise Problem(400,'Invalid length')
-                require(0<=length<=131072,413,'Request too large')
-                try: payload=json.loads(self.rfile.read(length) or b'{}')
-                except (ValueError,UnicodeError): raise Problem(400,'Invalid JSON')
-                require(isinstance(payload,dict))
+                limit=MAX_UPLOAD_BYTES+65536 if content_type.startswith('multipart/form-data;') else 131072
+                require(0<=length<=limit,413,'Request too large')
+                # Reject unauthenticated/CSRF-invalid uploads before reading or parsing
+                # potentially expensive multipart bodies.
+                if content_type.startswith('multipart/form-data;'):
+                    cookie=SimpleCookie()
+                    try: cookie.load(self.headers.get('Cookie',''))
+                    except Exception: pass
+                    pretoken=cookie['brightclean_session'].value if 'brightclean_session' in cookie else ''
+                    presession=app.sessions.get(pretoken)
+                    require(presession is not None,401,'Sign in to continue')
+                    require(hmac.compare_digest(self.headers.get('X-CSRF-Token','').encode(),presession['csrf'].encode()),403,'CSRF token missing or invalid')
+                raw=self.rfile.read(length)
+                if content_type.startswith('multipart/form-data;'):
+                    try:
+                        message=BytesParser(policy=email_policy).parsebytes((f'Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n').encode()+raw)
+                        parts=list(message.iter_parts()); require(len(parts)<=10,400,'Too many multipart fields')
+                        files=[p for p in parts if p.get_filename() is not None]; require(len(files)==1,400,'Exactly one file is required')
+                        upload=(files[0].get_filename(),files[0].get_payload(decode=True) or b'')
+                        payload={p.get_param('name',header='content-disposition'):p.get_content() for p in parts if p.get_filename() is None and p.get_param('name',header='content-disposition')}
+                    except Problem: raise
+                    except Exception: raise Problem(400,'Invalid multipart upload')
+                else:
+                    require(content_type.split(';')[0]=='application/json',415,'JSON or multipart form data required')
+                    try: payload=json.loads(raw or b'{}')
+                    except (ValueError,UnicodeError): raise Problem(400,'Invalid JSON')
+                    require(isinstance(payload,dict))
             with app.lock:
                 now=time.time()
                 app.sessions={k:v for k,v in app.sessions.items() if v['expires']>now}
@@ -319,6 +490,15 @@ class Handler(BaseHTTPRequestHandler):
                     del app.sessions[token]
                     self.send(200,{'ok':True},{'Set-Cookie':'brightclean_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0'}); return
                 require((path=='/api/settings' or payload.get('site_id',SITE)==SITE) and all(v==SITE for v in parse_qs(parsed.query).get('site_id',[])),403,'Site is outside this demo')
+                upload_match=re.fullmatch(r'/api/uploads/([A-Za-z0-9_]+)/file',path)
+                delete_match=re.fullmatch(r'/api/uploads/([A-Za-z0-9_]+)',path)
+                if path=='/api/uploads' and method=='POST':
+                    require(upload is not None,400,'File is required'); data=app.upload_knowledge(SITE,upload[0],upload[1]); self.send(201,data); return
+                if path=='/api/uploads' and method=='GET': self.send(200,{'items':app._read_uploads()}); return
+                if upload_match and method=='GET':
+                    data,name,mime=app.download_upload(SITE,upload_match.group(1)); safe_name=re.sub(r'[^A-Za-z0-9._ -]','_',name)
+                    self.send(200,data,{'Content-Disposition':f'attachment; filename="{safe_name}"'},ctype=mime); return
+                if delete_match and method=='DELETE': self.send(200,app.delete_upload(SITE,delete_match.group(1))); return
                 parts=path.strip('/').split('/')
                 require(len(parts) in (2,3) and parts[0]=='api',404,'Not found')
                 resource=parts[1]; ident=parts[2] if len(parts)==3 else None

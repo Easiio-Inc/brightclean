@@ -20,6 +20,7 @@ data/*.db
 data/*.db-*
 data/*.sqlite
 data/*.sqlite-*
+data/knowledge-files/
 
 # Seeded knowledge and non-secret settings JSON are intentionally trackable.
 !data/rag-content.json

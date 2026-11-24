@@ -49,6 +49,7 @@ async function navigate(next) {
    await loadSettings();
   } else {
    $('list-title').textContent=config[tab].title; $('list-description').textContent=config[tab].description;
+   $('knowledge-upload').hidden=tab!=='rag';
    $('add').textContent=tab==='rag'?'Add knowledge':'Add '+tab.slice(0,-1); $('search').value='';
    rows=[]; render(); const selected=tab; const result=await api(tab); if(tab===selected) {rows=result;render();}
   }
@@ -72,15 +73,22 @@ function render() {
    const td=el('td',String(value).length>150?String(value).slice(0,150)+'…':String(value));tr.append(td);
   }
   const actions=el('td'), edit=el('button','Edit','secondary'), remove=el('button','Delete','delete');
+  if(row.url && row.url.startsWith('/api/uploads/')) { const source_link=el('a','Original','secondary'); source_link.href=row.url; source_link.target='_blank'; source_link.rel='noopener'; actions.append(source_link); }
   edit.setAttribute('aria-label','Edit '+(row.name||row.title||row.kind)); remove.setAttribute('aria-label','Delete '+(row.name||row.title||row.kind));
-  edit.onclick=()=>openEditor(row); remove.onclick=async()=>{
+  edit.hidden=Boolean(row.upload_id); edit.onclick=()=>openEditor(row); remove.onclick=async()=>{
    if(!confirm('Delete this record? This cannot be undone.')) return;
-   try { await api(tab+'/'+(row.content_id||row.id),'DELETE',{}); await navigate(tab); message('Record deleted.'); } catch(error) { message(error.message,true); }
+   try { const route=row.upload_id?'uploads/'+row.upload_id:tab+'/'+(row.content_id||row.id); await api(route,'DELETE',{}); await navigate(tab); message('Record deleted.'); } catch(error) { message(error.message,true); }
   };
   actions.append(edit,remove);tr.append(actions);$('table-body').append(tr);
  }
 }
 $('search').oninput=render; $('refresh').onclick=()=>navigate(tab); $('add').onclick=()=>openEditor();
+$('knowledge-upload').onsubmit=async event=>{
+ event.preventDefault(); const file=$('knowledge-file').files[0], status=$('upload-status'), button=event.submitter; if(!file)return;
+ status.textContent='Uploading and indexing…';button.disabled=true;
+ try { const form=new FormData();form.append('file',file); const response=await fetch('/api/uploads',{method:'POST',headers:{'X-CSRF-Token':csrf},credentials:'same-origin',body:form}); const result=await response.json(); if(!response.ok)throw new Error(result.error||'Upload failed'); status.textContent=result.indexed?`Uploaded and vector-indexed ${result.original_filename}: ${result.chunk_count} chunks`:`Uploaded ${result.original_filename}: JSON search only. ${result.index_warning||'Vector indexing unavailable.'}`; event.target.reset(); await navigate('rag'); }
+ catch(error){status.textContent=error.message;} finally{button.disabled=false;}
+};
 async function openEditor(row=null) {
  editing=row; const cfg=config[tab]; $('fields').replaceChildren(); $('form-error').textContent='';
  $('editor-title').textContent=(row?'Edit ':'New ')+(tab==='rag'?'knowledge item':tab.slice(0,-1));
